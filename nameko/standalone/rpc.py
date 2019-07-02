@@ -2,6 +2,7 @@ from __future__ import absolute_import
 
 import logging
 import socket
+import time
 
 from amqp.exceptions import ConnectionError
 from kombu import Connection
@@ -81,6 +82,7 @@ class PollingQueueConsumer(object):
     the same correlation ID of the RPC-proxy call arrives.
     """
     consumer = None
+    connection = None
 
     def __init__(self, timeout=None):
         self.stopped = True
@@ -100,6 +102,7 @@ class PollingQueueConsumer(object):
                 # it and assume the consumer is already cancelled.
                 pass
 
+        _logger.debug("setup channel from connection")
         channel = self.connection.channel()
         # queue.bind returns a bound copy
         self.queue = self.queue.bind(channel)
@@ -110,16 +113,28 @@ class PollingQueueConsumer(object):
         consumer.consume()
         self.consumer = consumer
 
+    def _setup_connection(self):
+        if self.connection is not None:
+            try:
+                self.connection.close()
+            except (socket.error, IOError):  # pragma: no cover
+                # If the socket has been closed, an IOError is raised, ignore
+                # it and assume the connection is already closed.
+                pass
+
+        amqp_uri = self.provider.container.config[AMQP_URI_CONFIG_KEY]
+        ssl = self.provider.container.config.get(AMQP_SSL_CONFIG_KEY)
+        _logger.debug("setup connection to broker")
+        verify_amqp_uri(amqp_uri, ssl=ssl)
+        self.connection = Connection(amqp_uri, ssl=ssl)
+
     def register_provider(self, provider):
         self.provider = provider
 
         self.serializer, self.accept = serialization.setup(
             provider.container.config)
 
-        amqp_uri = provider.container.config[AMQP_URI_CONFIG_KEY]
-        ssl = provider.container.config.get(AMQP_SSL_CONFIG_KEY)
-        verify_amqp_uri(amqp_uri, ssl=ssl)
-        self.connection = Connection(amqp_uri, ssl=ssl)
+        self._setup_connection()
 
         self.queue = provider.queue
         self._setup_consumer()
@@ -141,39 +156,79 @@ class PollingQueueConsumer(object):
         self.replies[msg_correlation_id] = (body, message)
 
     def get_message(self, correlation_id):
+        _logger.debug("waiting for message with correlation id: %s", correlation_id)
+        start_time = time.time()
+        stop_waiting = False
+        remaining_timeout = lambda: abs(start_time + self.timeout - time.time()) if self.timeout is not None else None
 
-        try:
-            while correlation_id not in self.replies:
-                self.consumer.connection.drain_events(
-                    timeout=self.timeout
-                )
+        while correlation_id not in self.replies:
+            recover_connection = False
+            try:
+                self.consumer.connection.drain_events(timeout=remaining_timeout())
 
-            body, message = self.replies.pop(correlation_id)
-            self.provider.handle_message(body, message)
+            except socket.timeout as exc:
+                recover_connection = True
 
-        except socket.timeout:
-            # TODO: this conflates an rpc timeout with a socket read timeout.
-            # a better rpc proxy implementation would recover from a socket
-            # timeout if the rpc timeout had not yet been reached
-            timeout_error = RpcTimeout(self.timeout)
-            event = self.provider._reply_events.pop(correlation_id)
-            event.send_exception(timeout_error)
+            except (socket.error, ConnectionError) as exc:
+                # in case this was a temporary error, attempt to reconnect
+                # and try again. if we fail to reconnect, the error will bubble
+                # wait till connection stable before retry
+                try:
+                    self._setup_connection()
+                    self.connection.ensure_connection(max_retries=3, timeout=remaining_timeout())
+                    if self.connection.connected is True:
+                        self._setup_consumer()
+                        self.consumer.connection.drain_events(timeout=remaining_timeout())
+                        # if timeout happen during stablizing connection then it will be treated as connection error
+                    else:
+                        err_msg = "Unable to stablizing connnection after error, {}: {}".format(exc, exc.args[0])
+                        _logger.debug(err_msg)
+                        event = self.provider._reply_events.pop(correlation_id)
+                        event.send_exception(ConnectionError(err_msg))
+                        stop_waiting = True
+                except (socket.error, ConnectionError) as exc2:
+                    err_msg = "Error during stablizing connnection, {}: {}".format(exc2, exc2.args[0])
+                    _logger.debug(err_msg)
+                    event = self.provider._reply_events.pop(correlation_id)
+                    event.send_exception(ConnectionError(err_msg))
+                    stop_waiting = True
+                else:
+                    if abs(time.time() - start_time) > self.timeout:
+                        err_msg = "Timeout during stablizing connnection after error, {}: {}".format(exc, exc.args[0])
+                        _logger.debug(err_msg)
+                        event = self.provider._reply_events.pop(correlation_id)
+                        event.send_exception(socket.timeout(err_msg))
+                        stop_waiting = True
+                        recover_connection = True
 
-            # timeout is implemented using socket timeout, so when it
-            # fires the connection is closed and must be re-established
-            self._setup_consumer()
+            except KeyboardInterrupt as exc:
+                event = self.provider._reply_events.pop(correlation_id)
+                event.send_exception(exc)
+                recover_connection = True
+                stop_waiting = True  # stop waiting
 
-        except (IOError, ConnectionError) as exc:
-            # in case this was a temporary error, attempt to reconnect
-            # and try again. if we fail to reconnect, the error will bubble
-            self._setup_consumer()
-            self.get_message(correlation_id)
-
-        except KeyboardInterrupt as exc:
-            event = self.provider._reply_events.pop(correlation_id)
-            event.send_exception(exc)
-            # exception may have killed the connection
-            self._setup_consumer()
+            finally:
+                if not stop_waiting:
+                    if correlation_id in self.replies:
+                        body, message = self.replies.pop(correlation_id)
+                        self.provider.handle_message(body, message)
+                        stop_waiting = True
+                        recover_connection = False
+                    else:
+                        if abs(time.time() - start_time) > self.timeout:
+                            err_msg = "Timeout after: {}".format(self.timeout)
+                            _logger.debug(err_msg)
+                            timeout_error = RpcTimeout(err_msg)
+                            event = self.provider._reply_events.pop(correlation_id)
+                            event.send_exception(timeout_error)
+                            stop_waiting = True
+                if recover_connection:  # alway try to recover the connection
+                    try:
+                        self._setup_consumer()
+                    except socket.error as exc:
+                        _logger.debug("Socket error during setup consumer, %s: %s", exc, exc.args[0])
+                if stop_waiting:  # stop waiting for result
+                    break
 
 
 class SingleThreadedReplyListener(ReplyListener):
@@ -186,6 +241,7 @@ class SingleThreadedReplyListener(ReplyListener):
         super(SingleThreadedReplyListener, self).__init__()
 
     def get_reply_event(self, correlation_id):
+        _logger.debug("register reply_event for correlation id: %s", correlation_id)
         reply_event = ConsumeEvent(self.queue_consumer, correlation_id)
         self._reply_events[correlation_id] = reply_event
         return reply_event
