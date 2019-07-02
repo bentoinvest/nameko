@@ -153,7 +153,6 @@ class PollingQueueConsumer(object):
         self.replies[msg_correlation_id] = (body, message)
 
     def get_message(self, correlation_id):
-        _logger.debug("waiting for message with correlation id: %s", correlation_id)
         start_time = time.time()
         stop_waiting = False
         remaining_timeout = lambda: abs(start_time + self.timeout - time.time()) if self.timeout is not None else None
@@ -171,6 +170,7 @@ class PollingQueueConsumer(object):
                 # and try again. if we fail to reconnect, the error will bubble
                 # wait till connection stable before retry
                 try:
+                    _logger.debug("Stabilizing connection to message broker due to connection error")
                     self._setup_connection()
                     self.connection.ensure_connection(max_retries=3, timeout=remaining_timeout())
                     if self.connection.connected is True:
@@ -178,20 +178,20 @@ class PollingQueueConsumer(object):
                         self.consumer.connection.drain_events(timeout=remaining_timeout())
                         # if timeout happen during stablizing connection then it will be treated as connection error
                     else:
-                        err_msg = "Unable to stablizing connnection after error, {}: {}".format(exc, exc.args[0])
+                        err_msg = "Unable to stabilizing connnection after error, {}: {}".format(exc, exc.args[0])
                         _logger.debug(err_msg)
                         event = self.provider._reply_events.pop(correlation_id)
                         event.send_exception(ConnectionError(err_msg))
                         stop_waiting = True
                 except (socket.error, ConnectionError) as exc2:
-                    err_msg = "Error during stablizing connnection, {}: {}".format(exc2, exc2.args[0])
+                    err_msg = "Error during stabilizing connnection, {}: {}".format(exc2, exc2.args[0])
                     _logger.debug(err_msg)
                     event = self.provider._reply_events.pop(correlation_id)
                     event.send_exception(ConnectionError(err_msg))
                     stop_waiting = True
                 else:
                     if abs(time.time() - start_time) > self.timeout:
-                        err_msg = "Timeout during stablizing connnection after error, {}: {}".format(exc, exc.args[0])
+                        err_msg = "Timeout during stabilizing connnection after error, {}: {}".format(exc, exc.args[0])
                         _logger.debug(err_msg)
                         event = self.provider._reply_events.pop(correlation_id)
                         event.send_exception(socket.timeout(err_msg))
@@ -238,7 +238,6 @@ class SingleThreadedReplyListener(ReplyListener):
         super(SingleThreadedReplyListener, self).__init__()
 
     def get_reply_event(self, correlation_id):
-        _logger.debug("register reply_event for correlation id: %s", correlation_id)
         reply_event = ConsumeEvent(self.queue_consumer, correlation_id)
         self._reply_events[correlation_id] = reply_event
         return reply_event
