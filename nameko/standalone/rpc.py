@@ -157,13 +157,14 @@ class PollingQueueConsumer(object):
         start_time = time.time()
         stop_waiting = False
         remaining_timeout = lambda: abs(start_time + self.timeout - time.time()) if self.timeout is not None else None
+        is_timed_out = lambda: abs(time.time() - start_time) > self.timeout if self.timeout is not None else False
 
         while correlation_id not in self.replies:
             recover_connection = False
             try:
                 self.consumer.connection.drain_events(timeout=remaining_timeout())
 
-            except socket.timeout as exc:
+            except socket.timeout:  # if socket timeout happen here, keep looping until self.timeout is reached
                 recover_connection = True
 
             except (socket.error, ConnectionError) as exc:
@@ -176,8 +177,9 @@ class PollingQueueConsumer(object):
                     self.connection.ensure_connection(max_retries=3, timeout=remaining_timeout())
                     if self.connection.connected is True:
                         self._setup_consumer()
+                        # if socket.timeout happen during stablizing connection then it will be treated as
+                        # connection error and wait event loop will be stoped
                         self.consumer.connection.drain_events(timeout=remaining_timeout())
-                        # if timeout happen during stablizing connection then it will be treated as connection error
                     else:
                         err_msg = "Unable to stabilizing connnection after error, {}: {}".format(exc, exc.args[0])
                         _logger.debug(err_msg)
@@ -191,7 +193,7 @@ class PollingQueueConsumer(object):
                     event.send_exception(ConnectionError(err_msg))
                     stop_waiting = True
                 else:
-                    if abs(time.time() - start_time) > self.timeout:
+                    if is_timed_out() is True:
                         err_msg = "Timeout during stabilizing connnection after error, {}: {}".format(exc, exc.args[0])
                         _logger.debug(err_msg)
                         event = self.provider._reply_events.pop(correlation_id)
@@ -203,7 +205,7 @@ class PollingQueueConsumer(object):
                 event = self.provider._reply_events.pop(correlation_id)
                 event.send_exception(exc)
                 recover_connection = True
-                stop_waiting = True  # stop waiting
+                stop_waiting = True
 
             finally:
                 if not stop_waiting:
@@ -213,7 +215,7 @@ class PollingQueueConsumer(object):
                         stop_waiting = True
                         recover_connection = False
                     else:
-                        if abs(time.time() - start_time) > self.timeout:
+                        if is_timed_out() is True:
                             err_msg = "Timeout after: {}".format(self.timeout)
                             _logger.debug(err_msg)
                             timeout_error = RpcTimeout(err_msg)
@@ -225,9 +227,11 @@ class PollingQueueConsumer(object):
                         self._setup_consumer()
                     except socket.error as exc:
                         _logger.debug("Socket error during setup consumer, %s: %s", exc, exc.args[0])
-                if stop_waiting:  # stop waiting for result
+                if stop_waiting:  # stop waiting for result, break the loop
                     break
-
+        else:  # other thread may have receive the message coresponding to this correlation_id before enter wait loop
+            body, message = self.replies.pop(correlation_id)
+            self.provider.handle_message(body, message)
 
 class SingleThreadedReplyListener(ReplyListener):
     """ A ReplyListener which uses a custom queue consumer and ConsumeEvent.
