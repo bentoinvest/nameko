@@ -78,7 +78,7 @@ Usage:
 
 
 def main(args):
-
+    sys.path.append('.')  # Add current working directory to System path
     if args.config:
         with open(args.config) as fle:
             config = yaml.unsafe_load(fle)
