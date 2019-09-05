@@ -159,72 +159,67 @@ class PollingQueueConsumer(object):
         stop_waiting = False
         remaining_timeout = lambda: abs(start_time + self.timeout - time.time()) if self.timeout is not None else None
         is_timed_out = lambda: abs(time.time() - start_time) > self.timeout if self.timeout is not None else False
-
+        timed_out_err_msg = "Timeout after: {}".format(self.timeout)
         while correlation_id not in self.replies:
             recover_connection = False
             try:
                 self.consumer.connection.drain_events(timeout=remaining_timeout())
-
-            except socket.timeout:  # if socket timeout happen here, keep looping until self.timeout is reached
-                recover_connection = True
-
+            except socket.timeout:
+                # if socket timeout happen here, keep looping until self.timeout is reached or correlation_id is found
+                pass
             except (socket.error, ConnectionError) as exc:
                 # in case this was a temporary error, attempt to reconnect
                 # and try again. if we fail to reconnect, the error will bubble
                 # wait till connection stable before retry
                 try:
+                    recover_connection = True
                     _logger.debug("Stabilizing connection to message broker due to connection error")
                     self._setup_connection()
-                    self.connection.ensure_connection(max_retries=3, timeout=remaining_timeout())
+                    self.connection.ensure_connection(max_retries=2, timeout=remaining_timeout())
                     if self.connection.connected is True:
                         self._setup_consumer()
                         # if socket.timeout happen during stablizing connection then it will be treated as
                         # connection error and wait event loop will be stoped
                         self.consumer.connection.drain_events(timeout=remaining_timeout())
+                        recover_connection = False
                     else:
                         err_msg = "Unable to stabilizing connnection after error, {}: {}".format(exc, exc.args[0])
                         _logger.debug(err_msg)
                         event = self.provider._reply_events.pop(correlation_id)
                         event.send_exception(ConnectionError(err_msg))
                         stop_waiting = True
+                except socket.timeout:
+                    timed_out_err_msg = "Timeout after stabilizing connnection: {}".format(self.timeout)
+                    # same as above, keep looping until self.timeout is reached or correlation_id is found
                 except (socket.error, ConnectionError) as exc2:
                     err_msg = "Error during stabilizing connnection, {}: {}".format(exc2, exc2.args[0])
                     _logger.debug(err_msg)
                     event = self.provider._reply_events.pop(correlation_id)
                     event.send_exception(ConnectionError(err_msg))
+                    recover_connection = True
                     stop_waiting = True
-                else:
-                    if is_timed_out() is True:
-                        err_msg = "Timeout during stabilizing connnection after error, {}: {}".format(exc, exc.args[0])
-                        _logger.debug(err_msg)
-                        event = self.provider._reply_events.pop(correlation_id)
-                        event.send_exception(socket.timeout(err_msg))
-                        stop_waiting = True
-                        recover_connection = True
-
             except KeyboardInterrupt as exc:
                 event = self.provider._reply_events.pop(correlation_id)
                 event.send_exception(exc)
                 recover_connection = True
                 stop_waiting = True
-
             finally:
-                if not stop_waiting:
-                    if correlation_id in self.replies:
-                        body, message = self.replies.pop(correlation_id)
-                        self.provider.handle_message(body, message)
+                if correlation_id in self.replies:
+                    body, message = self.replies.pop(correlation_id)
+                    self.provider.handle_message(body, message)
+                    stop_waiting = True
+                    recover_connection = False
+                else:
+                    if is_timed_out() is True:
+                        _logger.debug(timed_out_err_msg)
+                        timeout_error = RpcTimeout(timed_out_err_msg)
+                        event = self.provider._reply_events.pop(correlation_id)
+                        event.send_exception(timeout_error)
                         stop_waiting = True
-                        recover_connection = False
-                    else:
-                        if is_timed_out() is True:
-                            err_msg = "Timeout after: {}".format(self.timeout)
-                            _logger.debug(err_msg)
-                            timeout_error = RpcTimeout(err_msg)
-                            event = self.provider._reply_events.pop(correlation_id)
-                            event.send_exception(timeout_error)
-                            stop_waiting = True
-                if recover_connection:  # alway try to recover the connection
+                if recover_connection:  # alway try to recover the connection before exit if this flag is True
                     try:
+                        if self.connection.connected is False:
+                            self._setup_connection()
                         self._setup_consumer()
                     except socket.error as exc:
                         _logger.debug("Socket error during setup consumer, %s: %s", exc, exc.args[0])
