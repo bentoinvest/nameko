@@ -214,7 +214,7 @@ class PollingQueueConsumer(object):
             finally:
                 if heartbeat:
                     try:
-                        self.consumer.connection.connection.heartbeat_check()
+                        self.consumer.connection.heartbeat_check()
                     except (ConnectionError, socket.error) as exc:
                         _logger.info("Heart beat failed. System will auto recover broken connection: %s", str(exc))
                         recover_connection = True
