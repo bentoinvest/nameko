@@ -121,13 +121,13 @@ class PollingQueueConsumer(object):
 
         amqp_uri = self.provider.container.config[AMQP_URI_CONFIG_KEY]
         ssl = self.provider.container.config.get(AMQP_SSL_CONFIG_KEY)
-        heartbeat = self.provider.container.config.get(
+        self.heartbeat = self.provider.container.config.get(
             HEARTBEAT_CONFIG_KEY, DEFAULT_HEARTBEAT
         )
-        if heartbeat is not None and heartbeat < 0:
+        if self.heartbeat is not None and self.heartbeat < 0:
             raise ConfigurationError("value for '%s' can not be negative" % HEARTBEAT_CONFIG_KEY)
         verify_amqp_uri(amqp_uri, ssl=ssl)
-        self.connection = Connection(amqp_uri, ssl=ssl, heartbeat=heartbeat)
+        self.connection = Connection(amqp_uri, ssl=ssl, heartbeat=self.heartbeat)
 
     def register_provider(self, provider):
         self.provider = provider
@@ -159,18 +159,26 @@ class PollingQueueConsumer(object):
     def get_message(self, correlation_id):
         start_time = time.time()
         stop_waiting = False
+        RATE = 2
+        heartbeat_interval = self.heartbeat / RATE if self.heartbeat else 0
         true_timeout = lambda: abs(start_time + self.timeout - time.time()) if self.timeout is not None else None
-        remaining_timeout = lambda: (min(abs(start_time + self.timeout - time.time()), heartbeat)
-                                     if self.timeout is not None else heartbeat) if heartbeat else true_timeout()
+        remaining_timeout = lambda: (
+            min(abs(start_time + self.timeout - time.time()), heartbeat_interval)
+            if self.timeout is not None else heartbeat_interval) if self.heartbeat else true_timeout()
         is_timed_out = lambda: abs(time.time() - start_time) > self.timeout if self.timeout is not None else False
         timed_out_err_msg = "Timeout after: {}".format(self.timeout)
-        heartbeat = self.provider.container.config.get(
-            HEARTBEAT_CONFIG_KEY, DEFAULT_HEARTBEAT
-        )
 
         while correlation_id not in self.replies:
             recover_connection = False
             try:
+                if self.heartbeat:
+                    try:
+                        self.consumer.connection.heartbeat_check()
+                    except (ConnectionError, socket.error) as exc:
+                        _logger.info("Heart beat failed. System will auto recover broken connection: %s", str(exc))
+                        raise
+                    else:
+                        _logger.debug("Heart beat OK")
                 wait_timeout = remaining_timeout()
                 _logger.debug("wait_timeout=%s", wait_timeout)
                 self.consumer.connection.drain_events(timeout=wait_timeout)
@@ -216,14 +224,6 @@ class PollingQueueConsumer(object):
                 recover_connection = True
                 stop_waiting = True
             finally:
-                if heartbeat:
-                    try:
-                        self.consumer.connection.heartbeat_check()
-                    except (ConnectionError, socket.error) as exc:
-                        _logger.info("Heart beat failed. System will auto recover broken connection: %s", str(exc))
-                        recover_connection = True
-                    else:
-                        _logger.debug("Heart beat OK")
                 if correlation_id in self.replies:
                     body, message = self.replies.pop(correlation_id)
                     self.provider.handle_message(body, message)
