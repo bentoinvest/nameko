@@ -169,7 +169,9 @@ class PollingQueueConsumer(object):
         while correlation_id not in self.replies:
             recover_connection = False
             try:
-                self.consumer.connection.drain_events(timeout=remaining_timeout())
+                wait_timeout = remaining_timeout()
+                _logger.debug("wait_timeout=%s", wait_timeout)
+                self.consumer.connection.drain_events(timeout=wait_timeout)
             except socket.timeout:
                 # if socket timeout happen here, send a hearbeat and keep looping
                 # until self.timeout is reached or correlation_id is found
