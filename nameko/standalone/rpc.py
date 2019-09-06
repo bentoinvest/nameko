@@ -8,14 +8,12 @@ from amqp.exceptions import ConnectionError
 from kombu import Connection
 from kombu.common import maybe_declare
 from kombu.messaging import Consumer
-
 from nameko import serialization
 from nameko.constants import AMQP_SSL_CONFIG_KEY, AMQP_URI_CONFIG_KEY, HEARTBEAT_CONFIG_KEY, DEFAULT_HEARTBEAT
 from nameko.containers import WorkerContext
-from nameko.exceptions import RpcTimeout
+from nameko.exceptions import RpcTimeout, ConfigurationError
 from nameko.extensions import Entrypoint
 from nameko.rpc import ReplyListener, ServiceProxy
-
 
 _logger = logging.getLogger(__name__)
 
@@ -125,6 +123,8 @@ class PollingQueueConsumer(object):
         heartbeat = self.provider.container.config.get(
             HEARTBEAT_CONFIG_KEY, DEFAULT_HEARTBEAT
         )
+        if heartbeat is not None and heartbeat < 0:
+            raise ConfigurationError("value for '%s' can not be negative" % HEARTBEAT_CONFIG_KEY)
         self.connection = Connection(amqp_uri, ssl=ssl, heartbeat=heartbeat)
 
     def register_provider(self, provider):
@@ -157,15 +157,22 @@ class PollingQueueConsumer(object):
     def get_message(self, correlation_id):
         start_time = time.time()
         stop_waiting = False
-        remaining_timeout = lambda: abs(start_time + self.timeout - time.time()) if self.timeout is not None else None
+        true_timeout = lambda: abs(start_time + self.timeout - time.time()) if self.timeout is not None else None
+        remaining_timeout = lambda: (min(abs(start_time + self.timeout - time.time()), heartbeat)
+                                     if self.timeout is not None else heartbeat) if heartbeat else true_timeout()
         is_timed_out = lambda: abs(time.time() - start_time) > self.timeout if self.timeout is not None else False
         timed_out_err_msg = "Timeout after: {}".format(self.timeout)
+        heartbeat = self.provider.container.config.get(
+            HEARTBEAT_CONFIG_KEY, DEFAULT_HEARTBEAT
+        )
+
         while correlation_id not in self.replies:
             recover_connection = False
             try:
                 self.consumer.connection.drain_events(timeout=remaining_timeout())
             except socket.timeout:
-                # if socket timeout happen here, keep looping until self.timeout is reached or correlation_id is found
+                # if socket timeout happen here, send a hearbeat and keep looping
+                # until self.timeout is reached or correlation_id is found
                 pass
             except (socket.error, ConnectionError) as exc:
                 # in case this was a temporary error, attempt to reconnect
@@ -175,7 +182,7 @@ class PollingQueueConsumer(object):
                     recover_connection = True
                     _logger.debug("Stabilizing connection to message broker due to connection error")
                     self._setup_connection()
-                    self.connection.ensure_connection(max_retries=2, timeout=remaining_timeout())
+                    self.connection.ensure_connection(max_retries=2, timeout=true_timeout())
                     if self.connection.connected is True:
                         self._setup_consumer()
                         # if socket.timeout happen during stablizing connection then it will be treated as
@@ -190,7 +197,8 @@ class PollingQueueConsumer(object):
                         stop_waiting = True
                 except socket.timeout:
                     timed_out_err_msg = "Timeout after stabilizing connnection: {}".format(self.timeout)
-                    # same as above, keep looping until self.timeout is reached or correlation_id is found
+                    # same as above, send a hearbeat and keep looping until
+                    # self.timeout is reached or correlation_id is found
                 except (socket.error, ConnectionError) as exc2:
                     err_msg = "Error during stabilizing connnection, {}: {}".format(exc2, exc2.args[0])
                     _logger.debug(err_msg)
@@ -204,6 +212,14 @@ class PollingQueueConsumer(object):
                 recover_connection = True
                 stop_waiting = True
             finally:
+                if heartbeat:
+                    try:
+                        self.consumer.connection.connection.heartbeat_check()
+                    except (ConnectionError, socket.error) as exc:
+                        _logger.info("Heart beat failed. System will auto recover broken connection: %s", str(exc))
+                        recover_connection = True
+                    else:
+                        _logger.debug("Heart beat OK")
                 if correlation_id in self.replies:
                     body, message = self.replies.pop(correlation_id)
                     self.provider.handle_message(body, message)
@@ -228,6 +244,7 @@ class PollingQueueConsumer(object):
         else:  # other thread may have receive the message coresponding to this correlation_id before enter wait loop
             body, message = self.replies.pop(correlation_id)
             self.provider.handle_message(body, message)
+
 
 class SingleThreadedReplyListener(ReplyListener):
     """ A ReplyListener which uses a custom queue consumer and ConsumeEvent.
@@ -262,8 +279,8 @@ class StandaloneProxyBase(object):
     _proxy = None
 
     def __init__(
-        self, config, context_data=None, timeout=None,
-        reply_listener_cls=SingleThreadedReplyListener
+            self, config, context_data=None, timeout=None,
+            reply_listener_cls=SingleThreadedReplyListener
     ):
         container = self.ServiceContainer(config)
 
@@ -318,6 +335,7 @@ class ServiceRpcProxy(StandaloneProxyBase):
     serialised into the AMQP message headers, and specify custom worker
     context class to serialise them.
     """
+
     def __init__(self, service_name, *args, **kwargs):
         super(ServiceRpcProxy, self).__init__(*args, **kwargs)
         self._proxy = ServiceProxy(
@@ -370,6 +388,7 @@ class ClusterProxy(object):
             proxy['other-service'].method()
 
     """
+
     def __init__(self, worker_ctx, reply_listener):
         self._worker_ctx = worker_ctx
         self._reply_listener = reply_listener
