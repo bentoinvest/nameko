@@ -159,12 +159,11 @@ class PollingQueueConsumer(object):
     def get_message(self, correlation_id):
         start_time = time.time()
         stop_waiting = False
-        RATE = 2
-        heartbeat_interval = self.heartbeat / RATE if self.heartbeat else 0
+        RATE = 3
         true_timeout = lambda: abs(start_time + self.timeout - time.time()) if self.timeout is not None else None
         remaining_timeout = lambda: (
-            min(abs(start_time + self.timeout - time.time()), heartbeat_interval)
-            if self.timeout is not None else heartbeat_interval) if self.heartbeat else true_timeout()
+            min(abs(start_time + self.timeout - time.time()), self.heartbeat / RATE)
+            if self.timeout is not None else self.heartbeat / RATE) if self.heartbeat else true_timeout()
         is_timed_out = lambda: abs(time.time() - start_time) > self.timeout if self.timeout is not None else False
         timed_out_err_msg = "Timeout after: {}".format(self.timeout)
 
@@ -172,6 +171,7 @@ class PollingQueueConsumer(object):
             recover_connection = False
             try:
                 if self.heartbeat:
+                    RATE = min(3 + abs(time.time() - start_time) / self.heartbeat, self.heartbeat)
                     try:
                         self.consumer.connection.heartbeat_check()
                     except (ConnectionError, socket.error) as exc:
