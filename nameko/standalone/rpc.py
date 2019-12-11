@@ -17,6 +17,8 @@ from nameko.rpc import ReplyListener, ServiceProxy
 
 _logger = logging.getLogger(__name__)
 
+EXPECTED_IOERR_MSG_SET = {"Server unexpectedly closed connection"}
+
 
 class ConsumeEvent(object):
     """ Event for the RPC consumer with the same interface as eventlet.Event.
@@ -148,11 +150,12 @@ class PollingQueueConsumer(object):
     def get_message(self, correlation_id):
         start_time = time.time()
         stop_waiting = False
-        RATE = lambda: min(2 + abs(time.time() - start_time) / self.heartbeat, self.heartbeat)
+        HEARTBEAT_INTERVAL = lambda: self.consumer.connection.get_heartbeat_interval()
+        RATE = lambda: min(2 + abs(time.time() - start_time) / HEARTBEAT_INTERVAL(), HEARTBEAT_INTERVAL())
         true_timeout = lambda: abs(start_time + self.timeout - time.time()) if self.timeout is not None else None
         remaining_timeout = lambda: (
-            min(abs(start_time + self.timeout - time.time()), self.heartbeat / RATE())
-            if self.timeout is not None else self.heartbeat / RATE()) if self.heartbeat else true_timeout()
+            min(abs(start_time + self.timeout - time.time()), HEARTBEAT_INTERVAL() / RATE())
+            if self.timeout is not None else HEARTBEAT_INTERVAL() / RATE()) if self.heartbeat else true_timeout()
         is_timed_out = lambda: abs(time.time() - start_time) > self.timeout if self.timeout is not None else False
         timed_out_err_msg = "Timeout after: {}".format(self.timeout)
 
@@ -162,7 +165,7 @@ class PollingQueueConsumer(object):
                 if self.heartbeat:
                     try:
                         self.consumer.connection.heartbeat_check()
-                    except (ConnectionError, socket.error) as exc:
+                    except (ConnectionError, socket.error, IOError) as exc:
                         _logger.info("Heart beat failed. System will auto recover broken connection: %s", str(exc))
                         raise
                     else:
@@ -172,38 +175,41 @@ class PollingQueueConsumer(object):
                 # if socket timeout happen here, send a hearbeat and keep looping
                 # until self.timeout is reached or correlation_id is found
                 pass
-            except (socket.error, ConnectionError) as exc:
+            except (ConnectionError, socket.error, IOError) as exc:
                 # in case this was a temporary error, attempt to reconnect
                 # and try again. if we fail to reconnect, the error will bubble
                 # wait till connection stable before retry
-                try:
-                    recover_connection = True
-                    _logger.debug("Stabilizing connection to message broker due to connection error")
-                    self._setup_connection()
-                    self.connection.ensure_connection(max_retries=2, timeout=true_timeout())
-                    if self.connection.connected is True:
-                        self._setup_consumer()
-                        # if socket.timeout happen during stablizing connection then it will be treated as
-                        # connection error and wait event loop will be stoped
-                        self.consumer.connection.drain_events(timeout=remaining_timeout())
-                        recover_connection = False
-                    else:
-                        err_msg = "Unable to stabilizing connnection after error, {}: {}".format(exc, exc.args[0])
+                if isinstance(exc, IOError) and not isinstance(exc, socket.error):
+                    # check only certain IOError will attemt to reconnect otherwhile reraise
+                    if exc.args[0] not in EXPECTED_IOERR_MSG_SET:  # check error.message
+                        raise
+                if not is_timed_out():
+                    try:  # try to recover connection if there is still time
+                        recover_connection = True
+                        _logger.debug("Stabilizing connection to message broker due to connection error")
+                        self._setup_connection()
+                        self.connection.ensure_connection(max_retries=2, timeout=true_timeout())
+                        if self.connection.connected is True:
+                            self._setup_consumer()
+                            recover_connection = False
+                            # continue the loop to start send a heartbeat and wait result with this new connection
+                        else:
+                            err_msg = "Unable to stabilizing connnection after error, {}: {}".format(exc, exc.args[0])
+                            _logger.debug(err_msg)
+                            event = self.provider._reply_events.pop(correlation_id)
+                            event.send_exception(ConnectionError(err_msg))
+                            stop_waiting = True
+                    except socket.timeout:
+                        timed_out_err_msg = "Timeout after stabilizing connnection: {}".format(self.timeout)
+                        # continue the loop to try to recover connection until
+                        # either self.timeout is reached or correlation_id is found
+                    except (ConnectionError, socket.error) as exc2:
+                        err_msg = "Error during stabilizing connnection, {}: {}".format(exc2, exc2.args[0])
                         _logger.debug(err_msg)
                         event = self.provider._reply_events.pop(correlation_id)
                         event.send_exception(ConnectionError(err_msg))
+                        recover_connection = True
                         stop_waiting = True
-                except socket.timeout:
-                    timed_out_err_msg = "Timeout after stabilizing connnection: {}".format(self.timeout)
-                    # same as above, send a hearbeat and keep looping until
-                    # self.timeout is reached or correlation_id is found
-                except (socket.error, ConnectionError) as exc2:
-                    err_msg = "Error during stabilizing connnection, {}: {}".format(exc2, exc2.args[0])
-                    _logger.debug(err_msg)
-                    event = self.provider._reply_events.pop(correlation_id)
-                    event.send_exception(ConnectionError(err_msg))
-                    recover_connection = True
-                    stop_waiting = True
             except KeyboardInterrupt as exc:
                 event = self.provider._reply_events.pop(correlation_id)
                 event.send_exception(exc)
@@ -214,7 +220,6 @@ class PollingQueueConsumer(object):
                     body, message = self.replies.pop(correlation_id)
                     self.provider.handle_message(body, message)
                     stop_waiting = True
-                    recover_connection = False
                 else:
                     if is_timed_out() is True:
                         _logger.debug(timed_out_err_msg)
