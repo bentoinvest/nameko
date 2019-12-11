@@ -169,7 +169,8 @@ class PollingQueueConsumer(object):
                     try:
                         self.consumer.connection.heartbeat_check()
                     except (ConnectionError, socket.error, IOError) as exc:
-                        _logger.info("Heart beat failed. System will auto recover broken connection: %s", str(exc))
+                        _logger.info("Heart beat failed. System will auto recover broken connection, %s: %s",
+                                     type(exc).__name__, exc.args[0])
                         raise
                     else:
                         _logger.debug("Heart beat OK")
@@ -190,7 +191,8 @@ class PollingQueueConsumer(object):
                     try:  # try to recover connection if there is still time
                         recover_connection = True
                         _logger.debug(
-                            "Stabilizing connection to message broker due to error, {}: {}".format(exc, exc.args[0]))
+                            "Stabilizing connection to message broker due to error, {}: {}".format(type(exc).__name__,
+                                                                                                   exc.args[0]))
                         self._setup_connection()
                         self.connection.ensure_connection(max_retries=2, timeout=true_timeout())
                         if self.connection.connected is True:
@@ -198,7 +200,8 @@ class PollingQueueConsumer(object):
                             recover_connection = False
                             # continue the loop to start send a heartbeat and wait result with this new connection
                         else:
-                            err_msg = "Unable to stabilizing connnection after error, {}: {}".format(exc, exc.args[0])
+                            err_msg = "Unable to stabilizing connnection after error, {}: {}".format(type(exc).__name__,
+                                                                                                     exc.args[0])
                             _logger.debug(err_msg)
                             event = self.provider._reply_events.pop(correlation_id)
                             event.send_exception(ConnectionError(err_msg))
@@ -208,7 +211,8 @@ class PollingQueueConsumer(object):
                         # continue the loop to try to recover connection until
                         # either self.timeout is reached or correlation_id is found
                     except (ConnectionError, socket.error) as exc2:
-                        err_msg = "Error during stabilizing connnection, {}: {}".format(exc2, exc2.args[0])
+                        err_msg = "Error during stabilizing connnection, {}: {}".format(type(exc2).__name__,
+                                                                                        exc2.args[0])
                         _logger.debug(err_msg)
                         event = self.provider._reply_events.pop(correlation_id)
                         event.send_exception(ConnectionError(err_msg))
@@ -237,7 +241,7 @@ class PollingQueueConsumer(object):
                             self._setup_connection()
                         self._setup_consumer()
                     except socket.error as exc:
-                        _logger.debug("Socket error during setup consumer, %s: %s", exc, exc.args[0])
+                        _logger.debug("Socket error during setup consumer, %s: %s", type(exc).__name__, exc.args[0])
                 if stop_waiting:  # stop waiting for result, break the loop
                     break
         else:  # other thread may have receive the message coresponding to this correlation_id before enter wait loop
