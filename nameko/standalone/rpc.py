@@ -186,7 +186,8 @@ class PollingQueueConsumer(object):
                 if not is_timed_out():
                     try:  # try to recover connection if there is still time
                         recover_connection = True
-                        _logger.debug("Stabilizing connection to message broker due to connection error")
+                        _logger.debug(
+                            "Stabilizing connection to message broker due to error, {}: {}".format(exc, exc.args[0]))
                         self._setup_connection()
                         self.connection.ensure_connection(max_retries=2, timeout=true_timeout())
                         if self.connection.connected is True:
