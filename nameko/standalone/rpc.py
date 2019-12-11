@@ -153,7 +153,8 @@ class PollingQueueConsumer(object):
         start_time = time.time()
         stop_waiting = False
         HEARTBEAT_INTERVAL = lambda: self.consumer.connection.get_heartbeat_interval()
-        RATE = lambda: min(2 + abs(time.time() - start_time) / HEARTBEAT_INTERVAL(), HEARTBEAT_INTERVAL())
+        # BASE_RATE = 2, RATE_INCREASE_SLOWDOWN = 0.75, MIN_WAIT = 3 (secs)
+        RATE = lambda: min(2 + abs(time.time() - start_time) * .75 / HEARTBEAT_INTERVAL(), HEARTBEAT_INTERVAL() / 3)
         true_timeout = lambda: abs(start_time + self.timeout - time.time()) if self.timeout is not None else None
         remaining_timeout = lambda: (
             min(abs(start_time + self.timeout - time.time()), HEARTBEAT_INTERVAL() / RATE())
