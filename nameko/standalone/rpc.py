@@ -145,16 +145,28 @@ class PollingQueueConsumer(object):
         self.connection.close()
         self.stopped = True
 
-    def ack_message(self, msg):
-        msg.ack()
+    def ack_message(self, message):
+        # only attempt to ack if the message connection is alive;
+        # otherwise the message will already have been reclaimed by the broker
+        if message.channel.connection:
+            try:
+                message.ack()
+            except ConnectionError:  # pragma: no cover
+                pass  # ignore connection closing inside conditional
 
     def on_message(self, body, message):
         msg_correlation_id = message.properties.get('correlation_id')
+        unknown = False
         if msg_correlation_id not in self.provider._reply_events:
             _logger.debug(
                 "Unknown correlation id: %s", msg_correlation_id)
-
+            unknown = True
         self.replies[msg_correlation_id] = (body, message)
+        # ACK message here to notify broker that message has been received
+        # only if the msg is known by the consumer
+        if not unknown:
+            self.ack_message(message)
+
 
     def get_message(self, correlation_id):
         start_time = time.time()
@@ -269,6 +281,16 @@ class SingleThreadedReplyListener(ReplyListener):
         reply_event = ConsumeEvent(self.queue_consumer, correlation_id)
         self._reply_events[correlation_id] = reply_event
         return reply_event
+
+    def handle_message(self, body, message):
+        # attempt to ACK message if it hasn't been acked
+        if not message.acknowledged:
+            self.queue_consumer.ack_message(message)
+
+        correlation_id = message.properties.get('correlation_id')
+        # correlation_id must exist in _reply_events by the time this method is called
+        client_event = self._reply_events[correlation_id]
+        client_event.send(body)
 
 
 class StandaloneProxyBase(object):
