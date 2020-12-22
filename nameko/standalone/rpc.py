@@ -53,7 +53,8 @@ class ConsumeEvent(object):
             raise RuntimeError(
                 "This consumer has been stopped, and can no longer be used"
             )
-        if self.queue_consumer.connection is None:
+        if self.queue_consumer.connection is None or \
+                self.queue_consumer.connection.connected is False:
             # we can't just reconnect here. the consumer (and its exclusive,
             # auto-delete reply queue) must be re-established _before_ sending
             # any request, otherwise the reply queue may not exist when the
@@ -171,13 +172,13 @@ class PollingQueueConsumer(object):
     def get_message(self, correlation_id):
         start_time = time.time()
         stop_waiting = False
-        HEARTBEAT_INTERVAL = lambda: self.consumer.connection.get_heartbeat_interval()
-        # BASE_RATE = 2, RATE_INCREASE_SLOWDOWN = 0.75, MIN_WAIT = 3 (secs)
-        RATE = lambda: min(2 + abs(time.time() - start_time) * .75 / HEARTBEAT_INTERVAL(), HEARTBEAT_INTERVAL() / 3)
+        # retrieve agreed heartbeat interval of both party by query the server
+        HEARTBEAT_INTERVAL = self.consumer.connection.get_heartbeat_interval()
+        RATE = lambda: min(2 + abs(time.time() - start_time) * .75 / HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL / 3)
         true_timeout = lambda: abs(start_time + self.timeout - time.time()) if self.timeout is not None else None
         remaining_timeout = lambda: (
-            min(abs(start_time + self.timeout - time.time()), HEARTBEAT_INTERVAL() / RATE())
-            if self.timeout is not None else HEARTBEAT_INTERVAL() / RATE()) if self.heartbeat else true_timeout()
+            min(abs(start_time + self.timeout - time.time()), HEARTBEAT_INTERVAL / RATE())
+            if self.timeout is not None else HEARTBEAT_INTERVAL / RATE()) if self.heartbeat else true_timeout()
         is_timed_out = lambda: abs(time.time() - start_time) > self.timeout if self.timeout is not None else False
         timed_out_err_msg = "Timeout after: {}".format(self.timeout)
 
@@ -311,8 +312,8 @@ class StandaloneProxyBase(object):
     _proxy = None
 
     def __init__(
-            self, config, context_data=None, timeout=None,
-            reply_listener_cls=SingleThreadedReplyListener
+        self, config, context_data=None, timeout=None,
+        reply_listener_cls=SingleThreadedReplyListener
     ):
         container = self.ServiceContainer(config)
 
@@ -367,7 +368,6 @@ class ServiceRpcProxy(StandaloneProxyBase):
     serialised into the AMQP message headers, and specify custom worker
     context class to serialise them.
     """
-
     def __init__(self, service_name, *args, **kwargs):
         super(ServiceRpcProxy, self).__init__(*args, **kwargs)
         self._proxy = ServiceProxy(
@@ -420,7 +420,6 @@ class ClusterProxy(object):
             proxy['other-service'].method()
 
     """
-
     def __init__(self, worker_ctx, reply_listener):
         self._worker_ctx = worker_ctx
         self._reply_listener = reply_listener
