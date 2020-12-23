@@ -14,6 +14,7 @@ from kombu import Connection
 from kombu.common import maybe_declare
 from kombu.mixins import ConsumerMixin
 from kombu.pools import connections
+from contextlib import contextmanager
 from nameko.amqp.publish import Publisher as PublisherCore
 from nameko.amqp.publish import get_connection
 from nameko.constants import (
