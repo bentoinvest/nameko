@@ -188,8 +188,8 @@ class Publisher(DependencyProvider, HeaderEncoder):
 
 class QueueConsumer(SharedExtension, ProviderCollector, ConsumerMixin):
 
-    def __init__(self):
-
+    def __init__(self, short_lived=False):
+        self.short_lived = short_lived
         self._consumers = {}
         self._pending_remove_providers = {}
 
@@ -338,11 +338,15 @@ class QueueConsumer(SharedExtension, ProviderCollector, ConsumerMixin):
 
     @contextmanager
     def establish_connection(self):
-        # get connection object from kombu default connection pool
-        with connections[self.connection].acquire(block=True) as conn:
-            conn.ensure_connection(self.on_connection_error,
-                                   self.connect_max_retries)
-            yield conn
+        if self.short_lived is True:
+            # get connection object from kombu default connection pool
+            with connections[self.create_connection()].acquire(block=True) as conn:
+                conn.ensure_connection(self.on_connection_error,
+                                       self.connect_max_retries)
+                yield conn
+        else:
+            with super(QueueConsumer, self).establish_connection() as conn:
+                yield conn
 
     @property
     def connection(self):

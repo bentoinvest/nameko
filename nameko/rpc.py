@@ -230,7 +230,7 @@ class Responder(object):
 
 class ReplyListener(SharedExtension):
 
-    queue_consumer = QueueConsumer()
+    queue_consumer = QueueConsumer(short_lived=True)
 
     def __init__(self, **kwargs):
         self._reply_events = {}
