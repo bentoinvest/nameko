@@ -13,7 +13,7 @@ from eventlet.event import Event
 from kombu import Connection
 from kombu.common import maybe_declare
 from kombu.mixins import ConsumerMixin
-
+from kombu.pools import connections
 from nameko.amqp.publish import Publisher as PublisherCore
 from nameko.amqp.publish import get_connection
 from nameko.constants import (
@@ -334,6 +334,14 @@ class QueueConsumer(SharedExtension, ProviderCollector, ConsumerMixin):
             _log.debug('cancelling consumer [%s]: %s', provider, consumer)
             consumer.cancel()
             removed_event.send()
+
+    @contextmanager
+    def establish_connection(self):
+        # get connection object from kombu default connection pool
+        with connections[self.connection].acquire(block=True) as conn:
+            conn.ensure_connection(self.on_connection_error,
+                                   self.connect_max_retries)
+            yield conn
 
     @property
     def connection(self):
